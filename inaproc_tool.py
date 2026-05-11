@@ -27,7 +27,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import urlencode, urljoin
@@ -70,6 +70,9 @@ DEFAULT_DETAIL_DB_FIELD_MAP = {
     "Nilai Pagu": "nilai_pagu",
     "Satuan Kerja": "satuan_kerja",
     "Tanggal Tender": "tanggal_tender",
+    "tanggal_tender_mulai": "tanggal_tender_mulai",
+    "tanggal_tender_selesai": "tanggal_tender_selesai",
+    "durasi_tender": "durasi_tender",
 }
 
 
@@ -227,6 +230,168 @@ def make_unique_key(existing_keys: set[str], key: str) -> str:
     existing_keys.add(final_key)
     return final_key
 
+MONTH_MAP = {
+    "jan": 1,
+    "january": 1,
+    "januari": 1,
+
+    "feb": 2,
+    "february": 2,
+    "februari": 2,
+
+    "mar": 3,
+    "march": 3,
+    "maret": 3,
+
+    "apr": 4,
+    "april": 4,
+
+    "may": 5,
+    "mei": 5,
+
+    "jun": 6,
+    "june": 6,
+    "juni": 6,
+
+    "jul": 7,
+    "july": 7,
+    "juli": 7,
+
+    "aug": 8,
+    "agu": 8,
+    "agustus": 8,
+    "august": 8,
+
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+
+    "oct": 10,
+    "okt": 10,
+    "october": 10,
+    "oktober": 10,
+
+    "nov": 11,
+    "nop": 11,
+    "november": 11,
+
+    "dec": 12,
+    "des": 12,
+    "december": 12,
+    "desember": 12,
+}
+
+
+def cleanse_rupiah_to_int(value: Any) -> int | None:
+    """
+    Contoh:
+    - "Rp 367.400.000" -> 367400000
+    - "Rp 367.400.000,00" -> 367400000
+    """
+    text = clean_text(value)
+
+    if not text:
+        return None
+
+    text = re.sub(r"(?i)\brp\b", "", text).strip()
+
+    # Buang desimal format Indonesia, contoh: 1.000.000,00
+    if "," in text:
+        text = text.split(",", 1)[0]
+
+    digits = re.sub(r"\D+", "", text)
+
+    if not digits:
+        return None
+
+    return int(digits)
+
+
+def parse_tender_date(value: Any) -> date | None:
+    """
+    Contoh:
+    - "28 Dec 2021" -> date(2021, 12, 28)
+    - "18 Jan 2022" -> date(2022, 1, 18)
+    """
+    text = clean_text(value)
+
+    match = re.search(
+        r"(\d{1,2})\s+([A-Za-zÀ-ÿ.]+)\s+(\d{4})",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    if not match:
+        return None
+
+    day = int(match.group(1))
+    month_text = match.group(2).lower().replace(".", "")
+    year = int(match.group(3))
+
+    month = MONTH_MAP.get(month_text)
+
+    if month is None:
+        return None
+
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def split_tanggal_tender(value: Any) -> tuple[str | None, str | None, int | None]:
+    """
+    Contoh:
+    "28 Dec 2021 s/d 18 Jan 2022"
+    ->
+    ("2021-12-28", "2022-01-18", 21)
+    """
+    text = clean_text(value)
+
+    if not text:
+        return None, None, None
+
+    parts = re.split(
+        r"\s+(?:s/d|sd|sampai|sampai dengan|-|–|—)\s+",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )
+
+    if len(parts) != 2:
+        return None, None, None
+
+    start_date = parse_tender_date(parts[0])
+    end_date = parse_tender_date(parts[1])
+
+    if not start_date or not end_date:
+        return None, None, None
+
+    duration_days = (end_date - start_date).days
+
+    return start_date.isoformat(), end_date.isoformat(), duration_days
+
+
+def transform_detail_scraped_data(scraped_data: dict[str, Any]) -> dict[str, Any]:
+    """
+    Transform khusus hasil scrape detail tender sebelum disimpan ke CSV/DB.
+    """
+    if "Nilai HPS" in scraped_data:
+        scraped_data["Nilai HPS"] = cleanse_rupiah_to_int(scraped_data.get("Nilai HPS"))
+
+    if "Nilai Pagu" in scraped_data:
+        scraped_data["Nilai Pagu"] = cleanse_rupiah_to_int(scraped_data.get("Nilai Pagu"))
+
+    tanggal_tender_raw = scraped_data.get("Tanggal Tender")
+
+    if tanggal_tender_raw:
+        tanggal_mulai, tanggal_selesai, durasi_tender = split_tanggal_tender(tanggal_tender_raw)
+
+        scraped_data["tanggal_tender_mulai"] = tanggal_mulai
+        scraped_data["tanggal_tender_selesai"] = tanggal_selesai
+        scraped_data["durasi_tender"] = durasi_tender
+
+    return scraped_data
 
 def safe_filename(value: Any) -> str:
     text = str(value or "").strip().lower()
@@ -1184,6 +1349,8 @@ def scrape_detail_command(args: argparse.Namespace) -> int:
                         kode_paket=kode_paket,
                         timeout_ms=args.timeout,
                     )
+
+                    scraped_data = transform_detail_scraped_data(scraped_data)
 
                     scraped_data["db_update_status"] = "skipped"
                     scraped_data["db_update_error"] = ""
