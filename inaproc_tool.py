@@ -73,6 +73,109 @@ DEFAULT_DETAIL_DB_FIELD_MAP = {
 }
 
 
+
+# ============================================================
+# BROWSER RESOURCE POLICY
+# ============================================================
+
+DEFAULT_BLOCKED_RESOURCE_TYPES = ["image", "media", "font"]
+DEFAULT_BLOCKED_URL_KEYWORDS = [
+    "googletagmanager",
+    "google-analytics",
+    "analytics",
+    "doubleclick",
+    "adservice",
+    "facebook",
+    "hotjar",
+    "clarity",
+    "segment",
+]
+
+LOW_RESOURCE_CHROMIUM_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-background-networking",
+    "--disable-default-apps",
+    "--disable-extensions",
+    "--disable-sync",
+    "--disable-translate",
+    "--metrics-recording-only",
+    "--mute-audio",
+    "--no-first-run",
+    "--disable-popup-blocking",
+    "--disable-renderer-backgrounding",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-ipc-flooding-protection",
+]
+
+
+def parse_csv_option(value: str | None) -> list[str]:
+    if not value:
+        return []
+
+    items = []
+    for item in str(value).split(","):
+        item = item.strip().lower()
+        if item and item not in {"none", "false", "0", "-"}:
+            items.append(item)
+
+    return items
+
+
+def build_chromium_launch_args(args: argparse.Namespace, automation_controlled: bool = False) -> list[str]:
+    launch_args = []
+
+    if getattr(args, "low_resource_mode", True):
+        launch_args.extend(LOW_RESOURCE_CHROMIUM_ARGS)
+    else:
+        launch_args.extend(["--no-sandbox", "--disable-dev-shm-usage"])
+
+    if automation_controlled:
+        launch_args.append("--disable-blink-features=AutomationControlled")
+
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(launch_args))
+
+
+def apply_resource_blocking(context, args: argparse.Namespace) -> None:
+    if getattr(args, "no_resource_blocking", False):
+        logger.info("RESOURCE_BLOCKING disabled")
+        return
+
+    blocked_types = set(parse_csv_option(getattr(args, "block_resources", "")))
+    blocked_keywords = parse_csv_option(getattr(args, "block_url_keywords", ""))
+
+    if not blocked_types and not blocked_keywords:
+        logger.info("RESOURCE_BLOCKING empty_policy")
+        return
+
+    def handle_route(route, request):
+        try:
+            resource_type = request.resource_type
+            request_url = request.url.lower()
+
+            if resource_type in blocked_types:
+                route.abort()
+                return
+
+            if any(keyword in request_url for keyword in blocked_keywords):
+                route.abort()
+                return
+
+            route.continue_()
+        except Exception:
+            try:
+                route.continue_()
+            except Exception:
+                pass
+
+    context.route("**/*", handle_route)
+    logger.info(
+        "RESOURCE_BLOCKING enabled types=%s keywords=%s",
+        sorted(blocked_types),
+        blocked_keywords,
+    )
+
 # ============================================================
 # LOGGING + PATHS
 # ============================================================
@@ -148,6 +251,35 @@ def unique_headers(headers: list[str], width: int) -> list[str]:
         result.append(header if used[header] == 1 else f"{header}_{used[header]}")
 
     return result
+
+
+def load_env_file(path: Path = Path(".env"), override: bool = False) -> None:
+    """Load .env sederhana tanpa dependency tambahan.
+
+    Format yang didukung:
+      KEY=value
+      KEY="value"
+      KEY='value'
+
+    Environment variable yang sudah ada tidak ditimpa, kecuali override=True.
+    """
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+
+        if not key:
+            continue
+
+        if override or key not in os.environ:
+            os.environ[key] = value
 
 
 def read_csv_rows(path: Path) -> list[dict[str, str]]:
@@ -758,9 +890,14 @@ def scrape_list_command(args: argparse.Namespace) -> int:
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(
             headless=args.headless,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+            args=build_chromium_launch_args(args),
         )
-        page = browser.new_page(viewport={"width": 1440, "height": 1000})
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 720},
+            device_scale_factor=1,
+        )
+        apply_resource_blocking(context, args)
+        page = context.new_page()
         page.set_default_timeout(args.timeout)
 
         try:
@@ -790,7 +927,10 @@ def scrape_list_command(args: argparse.Namespace) -> int:
                     print("Tombol halaman berikutnya tidak ditemukan atau sudah disabled.")
                     break
         finally:
-            browser.close()
+            try:
+                context.close()
+            finally:
+                browser.close()
 
     write_records(output, all_records, output_format=args.format)
     elapsed = time.perf_counter() - start_time
@@ -1018,16 +1158,18 @@ def scrape_detail_command(args: argparse.Namespace) -> int:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(
                 headless=args.headless,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
+                args=build_chromium_launch_args(args),
             )
             context = browser.new_context(
-                viewport={"width": 1366, "height": 768},
+                viewport={"width": 1280, "height": 720},
+                device_scale_factor=1,
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/124.0.0.0 Safari/537.36"
                 ),
             )
+            apply_resource_blocking(context, args)
 
             try:
                 for idx, item in enumerate(work_items, start=1):
@@ -1541,10 +1683,11 @@ def scrape_participant_command(args: argparse.Namespace) -> int:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(
                 headless=args.headless,
-                args=["--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage", "--no-sandbox"],
+                args=build_chromium_launch_args(args, automation_controlled=True),
             )
             context = browser.new_context(
-                viewport={"width": 1366, "height": 768},
+                viewport={"width": 1280, "height": 720},
+                device_scale_factor=1,
                 accept_downloads=True,
                 locale="id-ID",
                 timezone_id="Asia/Jakarta",
@@ -1554,6 +1697,7 @@ def scrape_participant_command(args: argparse.Namespace) -> int:
                     "Chrome/124.0.0.0 Safari/537.36"
                 ),
             )
+            apply_resource_blocking(context, args)
             context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             """)
@@ -1652,9 +1796,34 @@ def add_common_browser_args(parser: argparse.ArgumentParser, default_headless: b
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--headless", dest="headless", action="store_true", help="Jalankan browser tanpa UI.")
     group.add_argument("--headful", dest="headless", action="store_false", help="Tampilkan browser saat scraping.")
-    parser.set_defaults(headless=default_headless)
+    parser.set_defaults(headless=default_headless, low_resource_mode=True)
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_MS, help="Timeout Playwright dalam milidetik.")
     parser.add_argument("--delay", type=float, default=0.0, help="Delay antar item/halaman dalam detik.")
+    parser.add_argument(
+        "--block-resources",
+        default=os.getenv("INAPROC_BLOCK_RESOURCES", ",".join(DEFAULT_BLOCKED_RESOURCE_TYPES)),
+        help=(
+            "Resource browser yang diblokir, pisahkan dengan koma. "
+            "Default aman untuk VPS: image,media,font. "
+            "Contoh agresif: image,media,font,stylesheet. Gunakan 'none' untuk kosong."
+        ),
+    )
+    parser.add_argument(
+        "--block-url-keywords",
+        default=os.getenv("INAPROC_BLOCK_URL_KEYWORDS", ",".join(DEFAULT_BLOCKED_URL_KEYWORDS)),
+        help="Keyword URL request yang diblokir, pisahkan dengan koma. Gunakan 'none' untuk kosong.",
+    )
+    parser.add_argument(
+        "--no-resource-blocking",
+        action="store_true",
+        help="Matikan semua route blocking resource.",
+    )
+    parser.add_argument(
+        "--no-low-resource-mode",
+        dest="low_resource_mode",
+        action="store_false",
+        help="Matikan Chromium args low-resource tambahan.",
+    )
 
 
 def add_db_args(parser: argparse.ArgumentParser) -> None:
@@ -1720,7 +1889,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     participant_parser.add_argument("--debug-trace", action="store_true", help="Aktifkan Playwright trace per row.")
     participant_parser.add_argument("--insert-db", action="store_true", help="Insert hasil peserta ke DB tender.participant.")
     participant_parser.add_argument("--max-consecutive-open-home-failures", type=int, default=3, help="Stop jika open_home gagal beruntun.")
-    add_common_browser_args(participant_parser, default_headless=False)
+    add_common_browser_args(participant_parser, default_headless=True)
     add_db_args(participant_parser)
     participant_parser.set_defaults(func=scrape_participant_command)
 
@@ -1728,6 +1897,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_env_file()
     args = parse_args(argv)
     try:
         return int(args.func(args) or 0)
