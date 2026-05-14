@@ -628,8 +628,13 @@ def make_item_key(mode: str, item: dict[str, Any]) -> str:
     if mode == "participant":
         kode = clean_text(item.get("kode_paket", item.get("Kode Paket", "")))
         instansi = clean_text(item.get("nama_instansi", item.get("Nama Instansi", "")))
-        return f"{normalize_key(instansi)}::{kode}"
-    return json.dumps(item, sort_keys=True, ensure_ascii=False)
+        tahun = (
+            clean_text(item.get("tahun_anggaran"))
+            or clean_text(item.get("year"))
+            or clean_text(item.get("Tahun Anggaran"))
+            or clean_text(item.get("Year"))
+        )
+    return f"{normalize_key(instansi)}::{tahun}::{kode}"
 
 
 def export_mode_results(store: OperationalStore, mode: str, output: Path, output_format: str = "csv") -> int:
@@ -870,7 +875,8 @@ def fetch_participant_items_by_batch_from_db(
     Rule:
     - batch adalah filter utama.
     - source tetap dari tabel detail.
-    - participant butuh nama_instansi + kode_paket.
+    - participant butuh nama_instansi + kode_paket + tahun_anggaran.
+    - --year tidak lagi menjadi primary input.
     - start_row basis 1.
     """
     if not batch:
@@ -892,11 +898,13 @@ def fetch_participant_items_by_batch_from_db(
         SELECT
             {key},
             nama_instansi,
+            tahun_anggaran,
             ROW_NUMBER() OVER (ORDER BY {key}) AS source_row_id
         FROM {schema}.{table}
         WHERE {key} IS NOT NULL
           AND batch = %s
           AND NULLIF(TRIM(COALESCE(nama_instansi::text, '')), '') IS NOT NULL
+          AND NULLIF(TRIM(COALESCE(tahun_anggaran::text, '')), '') IS NOT NULL
         ORDER BY {key}
     """
 
@@ -918,8 +926,9 @@ def fetch_participant_items_by_batch_from_db(
     for fallback_idx, row in enumerate(rows, start=start_index + 1):
         kode_paket = clean_text(row.get(config.key_field))
         nama_instansi = clean_text(row.get("nama_instansi"))
+        tahun_anggaran = clean_text(row.get("tahun_anggaran"))
 
-        if not kode_paket or not nama_instansi:
+        if not kode_paket or not nama_instansi or not tahun_anggaran:
             continue
 
         source_row_id = row.get("source_row_id") or fallback_idx
@@ -929,6 +938,8 @@ def fetch_participant_items_by_batch_from_db(
                 "source_row_id": int(source_row_id),
                 "kode_paket": kode_paket,
                 "nama_instansi": nama_instansi,
+                "tahun_anggaran": tahun_anggaran,
+                "year": tahun_anggaran,
                 "batch": batch,
                 "raw": {
                     "source": "db_batch_participant",
@@ -936,6 +947,7 @@ def fetch_participant_items_by_batch_from_db(
                     "source_row_id": int(source_row_id),
                     "kode_paket": kode_paket,
                     "nama_instansi": nama_instansi,
+                    "tahun_anggaran": tahun_anggaran,
                 },
             }
         )
@@ -2158,14 +2170,28 @@ def scrape_participant_item(
             pass
 
 
-def load_participant_work_items_from_csv(input_csv: Path) -> list[dict[str, Any]]:
+def load_participant_work_items_from_csv(
+    input_csv: Path,
+    fallback_year: str | None = None,
+) -> list[dict[str, Any]]:
     rows = read_csv_rows(input_csv)
     if not rows:
         return []
 
     fieldnames = list(rows[0].keys())
-    instansi_col = auto_find_column(fieldnames, ["Nama Instansi", "nama_instansi", "Instansi"])
-    kode_col = auto_find_column(fieldnames, ["Kode Paket", "kode_paket", "Kode"])
+
+    instansi_col = auto_find_column(
+        fieldnames,
+        ["Nama Instansi", "nama_instansi", "Instansi"],
+    )
+    kode_col = auto_find_column(
+        fieldnames,
+        ["Kode Paket", "kode_paket", "Kode"],
+    )
+    tahun_col = auto_find_column(
+        fieldnames,
+        ["Tahun Anggaran", "tahun_anggaran", "Year", "year", "Tahun"],
+    )
 
     if not instansi_col or not kode_col:
         raise ValueError(
@@ -2173,14 +2199,28 @@ def load_participant_work_items_from_csv(input_csv: Path) -> list[dict[str, Any]
             f"Kolom tersedia: {', '.join(fieldnames)}"
         )
 
-    return [
-        {
-            "source_row_id": idx,
-            "nama_instansi": clean_text(row.get(instansi_col, "")),
-            "kode_paket": clean_text(row.get(kode_col, "")),
-        }
-        for idx, row in enumerate(rows, start=1)
-    ]
+    items: list[dict[str, Any]] = []
+
+    for idx, row in enumerate(rows, start=1):
+        nama_instansi = clean_text(row.get(instansi_col, ""))
+        kode_paket = clean_text(row.get(kode_col, ""))
+        tahun_anggaran = clean_text(row.get(tahun_col, "")) if tahun_col else clean_text(fallback_year)
+
+        if not nama_instansi or not kode_paket or not tahun_anggaran:
+            continue
+
+        items.append(
+            {
+                "source_row_id": idx,
+                "nama_instansi": nama_instansi,
+                "kode_paket": kode_paket,
+                "tahun_anggaran": tahun_anggaran,
+                "year": tahun_anggaran,
+                "raw": row,
+            }
+        )
+
+    return items
 
 
 def load_participant_work_items_from_args(
@@ -2194,33 +2234,21 @@ def load_participant_work_items_from_args(
     Prioritas:
     1. --input-csv
     2. --from-db / default DB batch mode
+
+    Catatan:
+    - Untuk --from-db + --batch, tahun diambil dari kolom tahun_anggaran DB.
+    - Untuk --input-csv, tahun diambil dari kolom CSV.
+    - --year hanya fallback untuk CSV lama yang belum punya kolom tahun.
     """
 
     # =========================================================
     # CSV SOURCE
     # =========================================================
     if args.input_csv:
-        rows = load_work_items_from_csv(
-            input_csv=args.input_csv,
+        items = load_participant_work_items_from_csv(
+            input_csv=Path(args.input_csv),
+            fallback_year=args.year,
         )
-
-        items: list[dict[str, Any]] = []
-
-        for row in rows:
-            kode_paket = clean_text(row.get("Kode Paket"))
-            nama_instansi = clean_text(row.get("Nama Instansi"))
-
-            if not kode_paket or not nama_instansi:
-                continue
-
-            items.append(
-                {
-                    "source_row_id": row.get("source_row_id"),
-                    "kode_paket": kode_paket,
-                    "nama_instansi": nama_instansi,
-                    "raw": row,
-                }
-            )
 
         return apply_start_limit(
             items,
@@ -2272,7 +2300,11 @@ def scrape_participant_command(args: argparse.Namespace) -> int:
                 print(f"Exported {failed_total} failed rows to {args.failed}")
             return 0
 
-        work_items = load_participant_work_items(args, db_conn=db_conn, db_config=db_config)
+        work_items = load_participant_work_items_from_args(
+            args,
+            db_conn=db_conn,
+            db_config=db_config,
+        )
         store.upsert_items(mode, work_items, reset_failed=args.reset_failed)
         pending_rows = store.pending_items(
             mode,
@@ -2294,9 +2326,21 @@ def scrape_participant_command(args: argparse.Namespace) -> int:
                     item_key = row["item_key"]
                     nama_instansi = clean_text(item.get("nama_instansi", item.get("Nama Instansi", "")))
                     kode_paket = clean_text(item.get("kode_paket", item.get("Kode Paket", "")))
+                    tahun_anggaran = (
+                        clean_text(item.get("tahun_anggaran"))
+                        or clean_text(item.get("year"))
+                        or clean_text(item.get("Tahun Anggaran"))
+                        or clean_text(item.get("Year"))
+                        or clean_text(args.year)
+                    )
 
-                    if not nama_instansi or not kode_paket:
-                        store.mark_failed(mode, item_key, "Nama Instansi atau Kode Paket kosong.", "validate_input")
+                    if not nama_instansi or not kode_paket or not tahun_anggaran:
+                        store.mark_failed(
+                            mode,
+                            item_key,
+                            "Nama Instansi, Kode Paket, atau Tahun Anggaran kosong.",
+                            "validate_input",
+                        )
                         failed_count += 1
                         continue
 
@@ -2307,14 +2351,14 @@ def scrape_participant_command(args: argparse.Namespace) -> int:
                     if args.cooldown_every > 0 and processed_total > 0 and processed_total % args.cooldown_every == 0:
                         random_cooldown(args.cooldown_min, args.cooldown_max, f"every_{args.cooldown_every}_items")
 
-                    print(f"[{index}/{len(pending_rows)}] Scraping peserta kode_paket={kode_paket}")
+                    print(f"[{index}/{len(pending_rows)}] Scraping peserta tahun={tahun_anggaran} kode_paket={kode_paket}")
                     try:
                         result = scrape_participant_item(
                             session=session,
                             db_conn=db_conn,
                             db_config=db_config,
                             item=item,
-                            year=str(args.year),
+                            year=tahun_anggaran,
                             timeout=args.timeout,
                             insert_db=args.insert_db,
                         )
@@ -2475,7 +2519,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Batch target scraping participant. Wajib untuk participant --from-db.",
     )
     participant_parser.add_argument("--nama-instansi", default=None, help=argparse.SUPPRESS)
-    participant_parser.add_argument("--year", required=False, help="Tahun paket yang dipilih di SPSE.")
+    participant_parser.add_argument(
+        "--year",
+        default=None,
+        help=(
+            "Opsional. Fallback hanya untuk source CSV lama yang tidak punya kolom tahun_anggaran. "
+            "Untuk --from-db + --batch, tahun diambil dari DB."
+        ),
+    )
     participant_parser.add_argument("--output", default="output/participant_final.csv", help="Path output final CSV/JSON.")
     participant_parser.add_argument("--failed", default="output/participant_failed.csv", help="Path CSV failed rows.")
     participant_parser.add_argument("--format", choices=["csv", "json"], default="csv", help="Format output.")
@@ -2515,6 +2566,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
         if args.from_db and not args.state_db:
             args.state_db = f"state/participant_batch_{safe_state_name(args.batch)}.sqlite"
+
+        if args.input_csv and not args.state_db:
+            source_name = safe_state_name(Path(args.input_csv).stem)
+            args.state_db = f"state/participant_csv_{source_name}.sqlite"
 
     return args
 
