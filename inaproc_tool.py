@@ -203,6 +203,13 @@ def safe_filename(value: Any) -> str:
     return text[:100] or "unknown"
 
 
+def safe_state_name(value: str) -> str:
+    value = clean_text(value).lower()
+    value = re.sub(r"[^a-zA-Z0-9_-]+", "_", value)
+    value = re.sub(r"_+", "_", value).strip("_")
+    return value or "default"
+
+
 def unique_headers(headers: list[str], width: int) -> list[str]:
     if not headers:
         headers = [f"column_{index + 1}" for index in range(width)]
@@ -498,20 +505,32 @@ class OperationalStore:
 
         self.conn.commit()
 
-    def pending_items(self, mode: str, retry_failed: bool = True) -> list[sqlite3.Row]:
+    def pending_items(
+        self,
+        mode: str,
+        retry_failed: bool = True,
+        limit: int | None = None,
+    ) -> list[sqlite3.Row]:
         if retry_failed:
             statuses = ("pending", "failed")
         else:
             statuses = ("pending",)
+
         placeholders = ",".join("?" for _ in statuses)
-        rows = self.conn.execute(
-            f"""
+
+        query = f"""
             SELECT * FROM scrape_items
             WHERE mode = ? AND status IN ({placeholders})
             ORDER BY CAST(COALESCE(NULLIF(source_row_id, ''), '0') AS INTEGER), item_key
-            """,
-            (mode, *statuses),
-        ).fetchall()
+        """
+
+        params: list[Any] = [mode, *statuses]
+
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+
+        rows = self.conn.execute(query, params).fetchall()
         return rows
 
     def count_by_status(self, mode: str) -> dict[str, int]:
@@ -757,6 +776,87 @@ def load_work_items_from_db(
         for idx, kode_paket in enumerate(kode_paket_list, start=1 + start)
     ]
 
+def fetch_detail_items_by_batch_from_db(
+    conn,
+    config: DbConfig,
+    batch: str,
+    start_row: int | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Ambil target scraping detail dari DB.
+
+    Rule:
+    - batch adalah filter utama.
+    - setelah itu hanya ambil row dengan instansi NULL/kosong.
+    - start_row basis 1.
+    """
+    if not batch:
+        raise ValueError("--batch wajib diisi untuk detail scraping dari DB.")
+
+    if start_row is not None and start_row < 1:
+        raise ValueError("--start / --start-row harus minimal 1.")
+
+    if limit is not None and limit < 1:
+        raise ValueError("--limit harus minimal 1 jika diisi.")
+
+    start_index = (start_row - 1) if start_row else 0
+
+    schema = quoted_ident(config.schema)
+    table = quoted_ident(config.detail_table)
+    key = quoted_ident(config.key_field)
+
+    query = f"""
+        SELECT
+            {key},
+            ROW_NUMBER() OVER (ORDER BY {key}) AS source_row_id
+        FROM {schema}.{table}
+        WHERE {key} IS NOT NULL
+          AND batch = %s
+          AND NULLIF(TRIM(COALESCE(instansi::text, '')), '') IS NULL
+        ORDER BY {key}
+    """
+
+    params: list[Any] = [batch]
+
+    if limit is not None:
+        query += " LIMIT %s OFFSET %s"
+        params.extend([limit, start_index])
+    elif start_index > 0:
+        query += " OFFSET %s"
+        params.append(start_index)
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+
+    items: list[dict[str, Any]] = []
+
+    for fallback_idx, row in enumerate(rows, start=start_index + 1):
+        kode_paket = clean_text(row.get(config.key_field))
+
+        if not kode_paket:
+            continue
+
+        source_row_id = row.get("source_row_id") or fallback_idx
+
+        items.append(
+            {
+                "source_row_id": int(source_row_id),
+                "kode_paket": kode_paket,
+                "url": detail_url_from_kode(kode_paket),
+                "batch": batch,
+                "raw": {
+                    "source": "db_batch_missing_instansi",
+                    "batch": batch,
+                    "source_row_id": int(source_row_id),
+                    "kode_paket": kode_paket,
+                },
+            }
+        )
+
+    return items
+
 def fetch_detail_items_missing_instansi_from_db(
     conn,
     config: DbConfig,
@@ -851,12 +951,7 @@ def update_detail_row(
     payload: dict[str, Any],
 ) -> tuple[bool, str, int]:
     """
-    Update hasil scraping detail berdasarkan kode_paket saja.
-
-    Catatan:
-    - Tidak memakai nama_instansi.
-    - Tidak memakai tahun_anggaran.
-    - Cocok dengan flow baru: ambil target dari DB berdasarkan instansi IS NULL.
+    Update detail berdasarkan kode_paket saja.
     """
     if not payload:
         return False, "Tidak ada field hasil scrape yang cocok dengan mapping database.", 0
@@ -1542,13 +1637,14 @@ def load_detail_work_items_from_args(args: argparse.Namespace, db_conn=None, db_
         ]
         return apply_start_limit(items, args.start_row, args.limit)
 
-    if args.from_db:
+     if args.from_db:
         if db_conn is None or db_config is None:
             raise ValueError("Koneksi DB belum tersedia.")
 
-        return fetch_detail_items_missing_instansi_from_db(
+        return fetch_detail_items_by_batch_from_db(
             conn=db_conn,
             config=db_config,
+            batch=args.batch,
             start_row=args.start_row,
             limit=args.limit,
         )
@@ -1567,6 +1663,9 @@ def load_field_map(path: str | None) -> dict[str, str]:
 
 def scrape_detail_command(args: argparse.Namespace) -> int:
     mode = "detail"
+    if args.from_db and not args.state_db:
+        args.state_db = f"state/detail_batch_{safe_state_name(args.batch)}.sqlite"
+
     store = OperationalStore(Path(args.state_db))
     field_map = load_field_map(args.field_map)
 
@@ -1586,7 +1685,11 @@ def scrape_detail_command(args: argparse.Namespace) -> int:
 
         work_items = load_detail_work_items_from_args(args, db_conn=db_conn, db_config=db_config)
         store.upsert_items(mode, work_items, reset_failed=args.reset_failed)
-        pending_rows = store.pending_items(mode, retry_failed=not args.no_retry_failed)
+        pending_rows = store.pending_items(
+            mode,
+            retry_failed=not args.no_retry_failed,
+            limit=args.limit,
+        )
         print(f"Total detail pending: {len(pending_rows)}")
 
         backoff = FailureBackoff(args.adaptive_error_threshold, args.adaptive_cooldown_base, args.adaptive_cooldown_max)
@@ -2072,7 +2175,11 @@ def add_common_browser_args(parser: argparse.ArgumentParser, default_headless: b
     parser.add_argument("--adaptive-error-threshold", type=int, default=2, help="Mulai adaptive cooldown setelah N error beruntun.")
     parser.add_argument("--adaptive-cooldown-base", type=float, default=5.0, help="Base adaptive cooldown dalam detik.")
     parser.add_argument("--adaptive-cooldown-max", type=float, default=90.0, help="Maksimum adaptive cooldown dalam detik.")
-    parser.add_argument("--state-db", default="state/inaproc_state.sqlite", help="SQLite operational storage untuk resume.")
+    parser.add_argument(
+        "--state-db",
+        default=None,
+        help="SQLite operational storage untuk resume. Untuk detail + --from-db, default otomatis: state/detail_batch_<batch>.sqlite",
+    )
     parser.add_argument("--export-only", action="store_true", help="Hanya export hasil sukses dari state DB ke output final.")
     parser.add_argument("--reset-failed", action="store_true", help="Set status failed menjadi pending saat mulai run.")
     parser.add_argument("--no-retry-failed", action="store_true", help="Jangan retry item failed pada run ini.")
@@ -2120,7 +2227,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     detail_source.add_argument(
         "--from-db",
         action="store_true",
-        help="Ambil kode_paket dari DB tender.details dengan filter instansi NULL/kosong.",
+        help="Ambil kode_paket dari DB berdasarkan batch dan instansi NULL/kosong.",
     )
     detail_parser.add_argument("--url-column", default=None, help="Nama kolom URL dalam CSV.")
     detail_parser.add_argument("--kode-column", default=None, help="Nama kolom kode paket dalam CSV.")
@@ -2145,11 +2252,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         dest="start_row",
         type=int,
         default=None,
-        help="Mulai dari row ke-n, basis 1. Alias: --start.",
+        help="Mulai dari row ke-n dalam batch, basis 1. Alias: --start.",
     )
     detail_parser.add_argument("--limit", type=int, default=None, help="Batasi jumlah item.")
     detail_parser.add_argument("--update-db", action="store_true", help="Update DB tender.details menggunakan hasil scrape.")
     detail_parser.add_argument("--field-map", default=None, help="JSON mapping label hasil scrape ke kolom DB.")
+    detail_parser.add_argument(
+        "--batch",
+        default=None,
+        help="Batch target scraping detail. Wajib untuk detail --from-db.",
+    )
     add_common_browser_args(detail_parser, default_headless=True)
     add_db_args(detail_parser)
     detail_parser.set_defaults(func=scrape_detail_command)
@@ -2174,10 +2286,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # Source tetap wajib kecuali export-only, agar bisa export dari state tanpa menyediakan input lagi.
     if args.command == "detail" and not args.export_only:
-        # Flow baru: kalau source tidak disebutkan, default ambil dari DB
-        # dengan filter instansi IS NULL.
         if not args.input_csv and not args.kode_paket and not args.from_db:
             args.from_db = True
+
+        if args.from_db and not args.batch:
+            parser.error("detail --from-db membutuhkan --batch.")
+
+        if args.from_db and not args.state_db:
+            args.state_db = f"state/detail_batch_{safe_state_name(args.batch)}.sqlite"
+    
     if args.command == "participant" and not args.export_only:
         if not args.input_csv and not args.from_db:
             parser.error("participant membutuhkan --input-csv atau --from-db kecuali --export-only.")
