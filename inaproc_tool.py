@@ -857,6 +857,91 @@ def fetch_detail_items_by_batch_from_db(
 
     return items
 
+def fetch_participant_items_by_batch_from_db(
+    conn,
+    config: DbConfig,
+    batch: str,
+    start_row: int | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Ambil target scraping peserta dari DB berdasarkan batch.
+
+    Rule:
+    - batch adalah filter utama.
+    - source tetap dari tabel detail.
+    - participant butuh nama_instansi + kode_paket.
+    - start_row basis 1.
+    """
+    if not batch:
+        raise ValueError("--batch wajib diisi untuk participant scraping dari DB.")
+
+    if start_row is not None and start_row < 1:
+        raise ValueError("--start / --start-row harus minimal 1.")
+
+    if limit is not None and limit < 1:
+        raise ValueError("--limit harus minimal 1 jika diisi.")
+
+    start_index = (start_row - 1) if start_row else 0
+
+    schema = quoted_ident(config.schema)
+    table = quoted_ident(config.detail_table)
+    key = quoted_ident(config.key_field)
+
+    query = f"""
+        SELECT
+            {key},
+            nama_instansi,
+            ROW_NUMBER() OVER (ORDER BY {key}) AS source_row_id
+        FROM {schema}.{table}
+        WHERE {key} IS NOT NULL
+          AND batch = %s
+          AND NULLIF(TRIM(COALESCE(nama_instansi::text, '')), '') IS NOT NULL
+        ORDER BY {key}
+    """
+
+    params: list[Any] = [batch]
+
+    if limit is not None:
+        query += " LIMIT %s OFFSET %s"
+        params.extend([limit, start_index])
+    elif start_index > 0:
+        query += " OFFSET %s"
+        params.append(start_index)
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+
+    items: list[dict[str, Any]] = []
+
+    for fallback_idx, row in enumerate(rows, start=start_index + 1):
+        kode_paket = clean_text(row.get(config.key_field))
+        nama_instansi = clean_text(row.get("nama_instansi"))
+
+        if not kode_paket or not nama_instansi:
+            continue
+
+        source_row_id = row.get("source_row_id") or fallback_idx
+
+        items.append(
+            {
+                "source_row_id": int(source_row_id),
+                "kode_paket": kode_paket,
+                "nama_instansi": nama_instansi,
+                "batch": batch,
+                "raw": {
+                    "source": "db_batch_participant",
+                    "batch": batch,
+                    "source_row_id": int(source_row_id),
+                    "kode_paket": kode_paket,
+                    "nama_instansi": nama_instansi,
+                },
+            }
+        )
+
+    return items
+
 def fetch_detail_items_missing_instansi_from_db(
     conn,
     config: DbConfig,
@@ -2098,32 +2183,80 @@ def load_participant_work_items_from_csv(input_csv: Path) -> list[dict[str, Any]
     ]
 
 
-def load_participant_work_items(args: argparse.Namespace, db_conn=None, db_config: DbConfig | None = None) -> list[dict[str, Any]]:
-    if args.input_csv:
-        items = load_participant_work_items_from_csv(Path(args.input_csv))
-        return apply_start_limit(items, args.start_row, args.limit)
+def load_participant_work_items_from_args(
+    args,
+    db_conn=None,
+    db_config=None,
+) -> list[dict[str, Any]]:
+    """
+    Resolve sumber data participant scraping.
 
-    if args.from_db:
-        if not args.nama_instansi:
-            raise ValueError("--nama-instansi wajib diisi untuk --from-db.")
-        if not args.year:
-            raise ValueError("--year wajib diisi untuk --from-db.")
-        if db_conn is None or db_config is None:
-            raise ValueError("Koneksi DB belum tersedia.")
-        return load_work_items_from_db(
-            conn=db_conn,
-            config=db_config,
-            year=str(args.year),
-            nama_instansi=args.nama_instansi,
-            start=(args.start_row - 1) if args.start_row else 0,
+    Prioritas:
+    1. --input-csv
+    2. --from-db / default DB batch mode
+    """
+
+    # =========================================================
+    # CSV SOURCE
+    # =========================================================
+    if args.input_csv:
+        rows = load_work_items_from_csv(
+            input_csv=args.input_csv,
+        )
+
+        items: list[dict[str, Any]] = []
+
+        for row in rows:
+            kode_paket = clean_text(row.get("Kode Paket"))
+            nama_instansi = clean_text(row.get("Nama Instansi"))
+
+            if not kode_paket or not nama_instansi:
+                continue
+
+            items.append(
+                {
+                    "source_row_id": row.get("source_row_id"),
+                    "kode_paket": kode_paket,
+                    "nama_instansi": nama_instansi,
+                    "raw": row,
+                }
+            )
+
+        return apply_start_limit(
+            items,
+            start_row=args.start_row,
             limit=args.limit,
         )
 
-    raise ValueError("Sumber peserta belum ditentukan. Gunakan --input-csv atau --from-db.")
+    # =========================================================
+    # DB SOURCE
+    # =========================================================
+    if args.from_db:
+        if db_conn is None or db_config is None:
+            raise ValueError("Koneksi DB belum tersedia.")
+
+        if not args.batch:
+            raise ValueError("--batch wajib diisi untuk participant --from-db.")
+
+        return fetch_participant_items_by_batch_from_db(
+            conn=db_conn,
+            config=db_config,
+            batch=args.batch,
+            start_row=args.start_row,
+            limit=args.limit,
+        )
+
+    raise ValueError(
+        "Sumber participant belum ditentukan. "
+        "Gunakan --input-csv atau --from-db."
+    )
 
 
 def scrape_participant_command(args: argparse.Namespace) -> int:
     mode = "participant"
+    if args.from_db and not args.state_db:
+        args.state_db = f"state/participant_batch_{safe_state_name(args.batch)}.sqlite"
+
     store = OperationalStore(Path(args.state_db))
     db_config = DbConfig.from_args(args)
     db_conn = None
@@ -2141,7 +2274,11 @@ def scrape_participant_command(args: argparse.Namespace) -> int:
 
         work_items = load_participant_work_items(args, db_conn=db_conn, db_config=db_config)
         store.upsert_items(mode, work_items, reset_failed=args.reset_failed)
-        pending_rows = store.pending_items(mode, retry_failed=not args.no_retry_failed)
+        pending_rows = store.pending_items(
+            mode,
+            retry_failed=not args.no_retry_failed,
+            limit=args.limit,
+        )
         print(f"Total participant pending: {len(pending_rows)}")
 
         backoff = FailureBackoff(args.adaptive_error_threshold, args.adaptive_cooldown_base, args.adaptive_cooldown_max)
@@ -2327,13 +2464,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     participant_parser = subparsers.add_parser("participant", help="Scrape peserta paket dari SPSE.")
     participant_source = participant_parser.add_mutually_exclusive_group(required=False)
     participant_source.add_argument("--input-csv", default=None, help="CSV sumber dengan kolom Nama Instansi dan Kode Paket.")
-    participant_source.add_argument("--from-db", action="store_true", help="Ambil kode paket dari DB tender.details.")
-    participant_parser.add_argument("--nama-instansi", default=None, help="Nama instansi untuk source DB.")
+    participant_source.add_argument(
+        "--from-db",
+        action="store_true",
+        help="Ambil kode_paket dan nama_instansi dari DB berdasarkan batch.",
+    )
+    participant_parser.add_argument(
+        "--batch",
+        default=None,
+        help="Batch target scraping participant. Wajib untuk participant --from-db.",
+    )
+    participant_parser.add_argument("--nama-instansi", default=None, help=argparse.SUPPRESS)
     participant_parser.add_argument("--year", required=False, help="Tahun paket yang dipilih di SPSE.")
     participant_parser.add_argument("--output", default="output/participant_final.csv", help="Path output final CSV/JSON.")
     participant_parser.add_argument("--failed", default="output/participant_failed.csv", help="Path CSV failed rows.")
     participant_parser.add_argument("--format", choices=["csv", "json"], default="csv", help="Format output.")
-    participant_parser.add_argument("--start-row", type=int, default=None, help="Mulai dari row ke-n, basis 1.")
+    participant_parser.add_argument(
+        "--start-row",
+        "--start",
+        dest="start_row",
+        type=int,
+        default=None,
+        help="Mulai dari row ke-n dalam batch, basis 1. Alias: --start.",
+    )
     participant_parser.add_argument("--limit", type=int, default=None, help="Batasi jumlah row/kode paket.")
     participant_parser.add_argument("--insert-db", action="store_true", help="Insert hasil peserta ke DB tender.participant.")
     add_common_browser_args(participant_parser, default_headless=True)
@@ -2355,9 +2508,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     
     if args.command == "participant" and not args.export_only:
         if not args.input_csv and not args.from_db:
-            parser.error("participant membutuhkan --input-csv atau --from-db kecuali --export-only.")
-        if not args.year:
-            parser.error("participant membutuhkan --year kecuali --export-only.")
+            args.from_db = True
+
+        if args.from_db and not args.batch:
+            parser.error("participant --from-db membutuhkan --batch.")
+
+        if args.from_db and not args.state_db:
+            args.state_db = f"state/participant_batch_{safe_state_name(args.batch)}.sqlite"
 
     return args
 
