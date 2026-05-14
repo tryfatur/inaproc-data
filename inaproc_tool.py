@@ -1625,21 +1625,76 @@ def load_detail_work_items_from_csv(input_csv: Path, url_column: str | None, kod
     return items
 
 
-def load_detail_work_items_from_args(args: argparse.Namespace, db_conn=None, db_config: DbConfig | None = None) -> list[dict[str, Any]]:
-    if args.input_csv:
-        items = load_detail_work_items_from_csv(Path(args.input_csv), args.url_column, args.kode_column)
-        return apply_start_limit(items, args.start_row, args.limit)
+def load_detail_work_items_from_args(
+    args,
+    db_conn=None,
+    db_config=None,
+) -> list[dict[str, Any]]:
+    """
+    Resolve sumber data detail scraping.
 
+    Prioritas:
+    1. --kode-paket
+    2. --input-csv
+    3. --from-db / default DB batch mode
+    """
+
+    # =========================================================
+    # SINGLE KODE PAKET
+    # =========================================================
     if args.kode_paket:
-        items = [
-            {"source_row_id": idx, "kode_paket": kode, "url": detail_url_from_kode(kode), "raw": {}}
-            for idx, kode in enumerate(args.kode_paket, start=1)
+        return [
+            {
+                "source_row_id": 1,
+                "kode_paket": args.kode_paket,
+                "url": detail_url_from_kode(args.kode_paket),
+                "raw": {
+                    "source": "single_kode_paket",
+                    "kode_paket": args.kode_paket,
+                },
+            }
         ]
-        return apply_start_limit(items, args.start_row, args.limit)
 
-     if args.from_db:
+    # =========================================================
+    # CSV SOURCE
+    # =========================================================
+    if args.input_csv:
+        rows = load_work_items_from_csv(
+            input_csv=args.input_csv,
+        )
+
+        items: list[dict[str, Any]] = []
+
+        for row in rows:
+            kode_paket = clean_text(row.get("Kode Paket"))
+
+            if not kode_paket:
+                continue
+
+            items.append(
+                {
+                    "source_row_id": row.get("source_row_id"),
+                    "kode_paket": kode_paket,
+                    "url": detail_url_from_kode(kode_paket),
+                    "raw": row,
+                }
+            )
+
+        return apply_start_limit(
+            items,
+            start_row=args.start_row,
+            limit=args.limit,
+        )
+
+    # =========================================================
+    # DB SOURCE
+    # =========================================================
+    if args.from_db:
         if db_conn is None or db_config is None:
             raise ValueError("Koneksi DB belum tersedia.")
+
+        if not args.batch:
+            raise ValueError("--batch wajib diisi untuk detail --from-db.")
 
         return fetch_detail_items_by_batch_from_db(
             conn=db_conn,
@@ -1649,7 +1704,10 @@ def load_detail_work_items_from_args(args: argparse.Namespace, db_conn=None, db_
             limit=args.limit,
         )
 
-    raise ValueError("Sumber detail belum ditentukan. Gunakan --input-csv, --kode-paket, atau --from-db.")
+    raise ValueError(
+        "Sumber detail belum ditentukan. "
+        "Gunakan --kode-paket, --input-csv, atau --from-db."
+    )
 
 
 def load_field_map(path: str | None) -> dict[str, str]:
