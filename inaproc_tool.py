@@ -88,6 +88,24 @@ DEFAULT_DETAIL_DB_FIELD_MAP = {
     "Tanggal Tender": "tanggal_tender",
 }
 
+DEFAULT_LIST_DB_FIELD_MAP = {
+    "Kode Paket": "kode_paket",
+    "Kode Paket URL": "kode_paket_url",
+    "Nama Instansi": "nama_instansi",
+    "Nama Satuan Kerja": "nama_satuan_kerja",
+    "Kode RUP": "kode_rup",
+    "Tahun Anggaran": "tahun_anggaran",
+    "Sumber Transaksi": "sumber_transaksi",
+    "Sumber Dana": "sumber_dana",
+    "Nama Penyedia": "nama_penyedia",
+    "Metode Pengadaan": "metode_pengadaan",
+    "Jenis Pengadaan": "jenis_pengadaan",
+    "Nama Paket": "nama_paket",
+    "Status Paket": "status_paket",
+    "Total Nilai (Rp)": "total_nilai",
+    "Nilai PDN (Rp)": "nilai_pdn"
+}
+
 MONTH_MAP = {
     "jan": 1,
     "january": 1,
@@ -717,6 +735,35 @@ def get_db_connection(config: DbConfig):
         password=config.password,
     )
 
+# def trace_db_connection(conn, config: DbConfig) -> None:
+#     with conn.cursor() as cur:
+#         cur.execute(
+#             """
+#             SELECT
+#                 current_database(),
+#                 current_user,
+#                 current_schema(),
+#                 inet_server_addr(),
+#                 inet_server_port()
+#             """
+#         )
+#         row = cur.fetchone()
+
+#     print("[DB TRACE] target config:")
+#     print(f"  host={config.host}")
+#     print(f"  port={config.port}")
+#     print(f"  dbname={config.dbname}")
+#     print(f"  user={config.user}")
+#     print(f"  schema={config.schema}")
+#     print(f"  table={config.detail_table}")
+#     print(f"  key_field={config.key_field}")
+#     print("[DB TRACE] actual connection:")
+#     print(f"  current_database={row[0]}")
+#     print(f"  current_user={row[1]}")
+#     print(f"  current_schema={row[2]}")
+#     print(f"  server_addr={row[3]}")
+#     print(f"  server_port={row[4]}")
+
 
 def quoted_ident(value: str) -> str:
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
@@ -1088,6 +1135,221 @@ def update_detail_row(
         conn.rollback()
         return False, str(exc), 0
 
+def to_snake_case(value: Any) -> str:
+    text = clean_text(value)
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", text)
+    text = re.sub(r"[^A-Za-z0-9_]+", "_", text)
+    text = re.sub(r"_+", "_", text)
+    return text.strip("_").lower()
+
+
+def get_table_columns(conn, config: DbConfig, table_name: str) -> set[str]:
+    query = """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = %s
+          AND table_name = %s
+    """
+
+    with conn.cursor() as cur:
+        cur.execute(query, (config.schema, table_name))
+        rows = cur.fetchall()
+
+    return {row[0] for row in rows}
+
+
+def normalize_list_record_for_db(
+    record: dict[str, Any],
+    db_columns: set[str],
+    field_map: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """
+    Normalisasi hasil scrape list ke struktur tender.details.
+
+    Rule:
+    - hanya field yang ada di tabel details yang dipakai
+    - field tidak dikenal diabaikan
+    - Total Nilai dibersihkan menjadi integer
+    """
+    field_map = field_map or DEFAULT_LIST_DB_FIELD_MAP
+
+    payload: dict[str, Any] = {}
+    mapped_source_fields: set[str] = set()
+
+    # Mapping eksplisit.
+    for source_field, db_field in field_map.items():
+        if source_field not in record:
+            continue
+
+        if db_field not in db_columns:
+            continue
+
+        value = record.get(source_field)
+
+        if db_field in {"total_nilai", "nilai_pdn"}:
+            value = cleanse_rupiah_to_int(value)
+
+        payload[db_field] = value
+        mapped_source_fields.add(source_field)
+
+    # Fallback otomatis: header -> snake_case -> cocokkan dengan kolom DB.
+    for source_field, value in record.items():
+        if source_field in mapped_source_fields:
+            continue
+
+        db_field = to_snake_case(source_field)
+
+        if db_field not in db_columns:
+            continue
+
+        if db_field in payload:
+            continue
+
+        if db_field in {"total_nilai", "nilai_pdn"}:
+            value = cleanse_rupiah_to_int(value)
+
+        payload[db_field] = value
+
+    return payload
+
+def insert_or_update_list_records_to_db(
+    conn,
+    config: DbConfig,
+    records: list[dict[str, Any]],
+) -> tuple[int, int, int, int, list[dict[str, Any]]]:
+    """
+    Insert/update hasil subcommand list ke tabel details.
+
+    Strategi:
+    - UPDATE dulu berdasarkan kode_paket
+    - Jika tidak ada row ter-update, lakukan INSERT
+    - Tidak butuh unique constraint
+    """
+    schema = quoted_ident(config.schema)
+    table = quoted_ident(config.detail_table)
+    key = quoted_ident(config.key_field)
+
+    db_columns = get_table_columns(
+        conn=conn,
+        config=config,
+        table_name=config.detail_table,
+    )
+
+    inserted_count = 0
+    updated_count = 0
+    skipped_count = 0
+    failed_count = 0
+    failed_rows: list[dict[str, Any]] = []
+
+    for index, record in enumerate(records, start=1):
+        payload = normalize_list_record_for_db(
+            record=record,
+            db_columns=db_columns,
+        )
+
+        kode_paket = clean_text(
+            payload.get(config.key_field)
+            or record.get("Kode Paket")
+            or record.get("kode_paket")
+        )
+
+        if not kode_paket:
+            skipped_count += 1
+            failed_rows.append(
+                {
+                    "index": index,
+                    "error": "kode_paket kosong, record dilewati.",
+                    "record": record,
+                }
+            )
+            continue
+
+        payload[config.key_field] = kode_paket
+
+        # Pastikan hanya kolom existing yang masuk payload.
+        payload = {
+            field: value
+            for field, value in payload.items()
+            if field in db_columns
+        }
+
+        if not payload:
+            skipped_count += 1
+            failed_rows.append(
+                {
+                    "index": index,
+                    "kode_paket": kode_paket,
+                    "error": "Tidak ada field yang cocok dengan struktur tabel details.",
+                    "record": record,
+                }
+            )
+            continue
+
+        update_payload = {
+            field: value
+            for field, value in payload.items()
+            if field != config.key_field
+        }
+
+        try:
+            # 1) UPDATE dulu.
+            affected_rows = 0
+
+            if update_payload:
+                set_clause = ", ".join(
+                    f"{quoted_ident(field)} = %s"
+                    for field in update_payload.keys()
+                )
+
+                update_values = list(update_payload.values())
+                update_values.append(kode_paket)
+
+                update_sql = f"""
+                    UPDATE {schema}.{table}
+                    SET {set_clause}
+                    WHERE {key} = %s
+                """
+
+                with conn.cursor() as cur:
+                    cur.execute(update_sql, update_values)
+                    affected_rows = cur.rowcount
+
+            if affected_rows > 0:
+                conn.commit()
+                updated_count += affected_rows
+                continue
+
+            # 2) Kalau belum ada row, INSERT.
+            insert_fields = list(payload.keys())
+            placeholders = ", ".join(["%s"] * len(insert_fields))
+            columns_sql = ", ".join(quoted_ident(field) for field in insert_fields)
+            insert_values = [payload[field] for field in insert_fields]
+
+            insert_sql = f"""
+                INSERT INTO {schema}.{table} ({columns_sql})
+                VALUES ({placeholders})
+            """
+
+            with conn.cursor() as cur:
+                cur.execute(insert_sql, insert_values)
+
+            conn.commit()
+            inserted_count += 1
+
+        except Exception as exc:
+            conn.rollback()
+            failed_count += 1
+            failed_rows.append(
+                {
+                    "index": index,
+                    "kode_paket": kode_paket,
+                    "error": str(exc),
+                    "record": record,
+                }
+            )
+            logger.exception("LIST_DB_INSERT_UPDATE_FAILED kode_paket='%s'", kode_paket)
+
+    return inserted_count, updated_count, skipped_count, failed_count, failed_rows
 
 def get_value_by_header(row: dict[str, Any], candidates: list[str]) -> str:
     normalized_row = {normalize_key(key): value for key, value in row.items()}
@@ -1339,14 +1601,23 @@ def run_step(step_name: str, func: Callable[[], Any]) -> Any:
 # LIST SCRAPER
 # ============================================================
 
-def build_realisasi_url(year: int) -> str:
+def build_realisasi_url(
+    year: int,
+    jenis_klpd: list[str] | None = None,
+    sumber: str = "Tender",
+) -> str:
+    if jenis_klpd is None:
+        jenis_klpd = ["3", "4", "5"]
+
     params = [
         ("tahun", str(year)),
-        ("jenis_klpd", "3"),
-        ("jenis_klpd", "4"),
-        ("jenis_klpd", "5"),
-        ("sumber", "Tender"),
     ]
+
+    for item in jenis_klpd:
+        params.append(("jenis_klpd", str(item)))
+
+    params.append(("sumber", sumber))
+
     return f"{INAPROC_REALISASI_BASE_URL}?{urlencode(params)}"
 
 
@@ -1499,36 +1770,127 @@ def build_list_work_items(start_page: int, end_page: int) -> list[dict[str, Any]
 def scrape_list_command(args: argparse.Namespace) -> int:
     if args.start_page < 1:
         raise ValueError("--start-page harus minimal 1.")
+
     if args.end_page < args.start_page:
         raise ValueError("--end-page harus lebih besar atau sama dengan --start-page.")
 
+    # Defensive defaults agar tidak terjadi Path(None).
+    if not getattr(args, "state_db", None):
+        args.state_db = "state/inaproc_state.sqlite"
+
+    if not getattr(args, "output", None):
+        args.output = "output/list_final.csv"
+
+    if not getattr(args, "failed", None):
+        args.failed = "output/list_failed.csv"
+
     mode = "list"
-    url = args.url or build_realisasi_url(args.year)
+
+    # Mendukung patch build_realisasi_url yang sudah menerima:
+    # --jenis-klpd dan --sumber.
+    url = args.url or build_realisasi_url(
+        year=args.year,
+        jenis_klpd=args.jenis_klpd,
+        sumber=args.sumber,
+    )
+
     store = OperationalStore(Path(args.state_db))
+
+    db_config = None
+    db_conn = None
+
+    if getattr(args, "insert_db", False):
+        db_config = DbConfig.from_args(args)
+        db_conn = get_db_connection(db_config)
+        # trace_db_connection(db_conn, db_config)
 
     try:
         if args.export_only:
-            total = export_mode_results(store, mode, Path(args.output), args.format)
+            total = export_mode_results(
+                store=store,
+                mode=mode,
+                output=Path(args.output),
+                output_format=args.format,
+            )
+
+            failed_total = export_failed(
+                store=store,
+                mode=mode,
+                failed_output=Path(args.failed) if args.failed else None,
+            )
+
             print(f"Exported {total} rows to {args.output}")
+
+            if args.failed:
+                print(f"Exported {failed_total} failed rows to {args.failed}")
+
+            print(f"State summary: {store.count_by_status(mode)}")
             return 0
 
-        work_items = build_list_work_items(args.start_page, args.end_page)
-        store.upsert_items(mode, work_items, reset_failed=args.reset_failed)
-        pending_rows = store.pending_items(mode, retry_failed=not args.no_retry_failed)
+        work_items = build_list_work_items(
+            start_page=args.start_page,
+            end_page=args.end_page,
+        )
+
+        store.upsert_items(
+            mode=mode,
+            items=work_items,
+            reset_failed=args.reset_failed,
+        )
+
+        pending_rows = store.pending_items(
+            mode=mode,
+            retry_failed=not args.no_retry_failed,
+        )
+
         print(f"Total list page pending: {len(pending_rows)}")
 
         if not pending_rows:
-            total = export_mode_results(store, mode, Path(args.output), args.format)
+            total = export_mode_results(
+                store=store,
+                mode=mode,
+                output=Path(args.output),
+                output_format=args.format,
+            )
+
+            failed_total = export_failed(
+                store=store,
+                mode=mode,
+                failed_output=Path(args.failed) if args.failed else None,
+            )
+
             print(f"Tidak ada pending. Exported {total} rows to {args.output}")
+
+            if args.failed:
+                print(f"Exported {failed_total} failed rows to {args.failed}")
+
+            print(f"State summary: {store.count_by_status(mode)}")
             return 0
 
-        backoff = FailureBackoff(args.adaptive_error_threshold, args.adaptive_cooldown_base, args.adaptive_cooldown_max)
+        backoff = FailureBackoff(
+            threshold=args.adaptive_error_threshold,
+            base_seconds=args.adaptive_cooldown_base,
+            max_seconds=args.adaptive_cooldown_max,
+        )
+
         processed_since_restart = 0
         processed_total = 0
+        success_count = 0
+        failed_count = 0
+
+        db_inserted_total = 0
+        db_updated_total = 0
+        db_skipped_total = 0
+        db_failed_total = 0
+
         current_page_obj: Page | None = None
 
         with sync_playwright() as playwright:
-            session = BrowserSession(playwright, build_browser_settings(args, width=1440, height=1000))
+            session = BrowserSession(
+                playwright=playwright,
+                settings=build_browser_settings(args, width=1440, height=1000),
+            )
+
             try:
                 for index, row in enumerate(pending_rows, start=1):
                     item = row_to_item(row)
@@ -1536,29 +1898,89 @@ def scrape_list_command(args: argparse.Namespace) -> int:
                     page_number = int(item["page_number"])
 
                     if processed_since_restart >= args.restart_browser_every:
-                        if current_page_obj is not None:
+                        if current_page_obj is not None and not current_page_obj.is_closed():
                             current_page_obj.close()
                             current_page_obj = None
+
                         session.restart(f"every_{args.restart_browser_every}_pages")
                         processed_since_restart = 0
 
-                    if args.cooldown_every > 0 and processed_total > 0 and processed_total % args.cooldown_every == 0:
-                        random_cooldown(args.cooldown_min, args.cooldown_max, f"every_{args.cooldown_every}_pages")
+                    if (
+                        args.cooldown_every > 0
+                        and processed_total > 0
+                        and processed_total % args.cooldown_every == 0
+                    ):
+                        random_cooldown(
+                            args.cooldown_min,
+                            args.cooldown_max,
+                            f"every_{args.cooldown_every}_pages",
+                        )
 
                     print(f"[{index}/{len(pending_rows)}] Scraping list page={page_number}")
+
                     try:
                         if current_page_obj is None or current_page_obj.is_closed():
-                            current_page_obj = open_list_page(session, url, args.entries_per_page, page_number)
+                            current_page_obj = open_list_page(
+                                session=session,
+                                url=url,
+                                entries_per_page=args.entries_per_page,
+                                target_page=page_number,
+                            )
                         elif index > 1:
-                            # Dalam alur normal page aktif sudah berada di halaman berikutnya.
+                            # Dalam alur normal, page aktif sudah berada di halaman berikutnya.
                             pass
 
                         records = extract_dataframe_table(current_page_obj)
+
+                        page_label = get_page_label(current_page_obj)
+
                         for record in records:
                             record["_scraped_page"] = page_number
-                            record["_page_label"] = get_page_label(current_page_obj)
+                            record["_page_label"] = page_label
+
+                        if getattr(args, "insert_db", False):
+                            if db_conn is None or db_config is None:
+                                raise ValueError("insert_db aktif, tetapi koneksi DB belum tersedia.")
+
+                            (
+                                inserted_count,
+                                updated_count,
+                                skipped_count,
+                                db_failed_count,
+                                db_failed_rows,
+                            ) = insert_or_update_list_records_to_db(
+                                conn=db_conn,
+                                config=db_config,
+                                records=records,
+                            )
+
+                            db_inserted_total += inserted_count
+                            db_updated_total += updated_count
+                            db_skipped_total += skipped_count
+                            db_failed_total += db_failed_count
+
+                            for record in records:
+                                record["_db_inserted_count"] = inserted_count
+                                record["_db_updated_count"] = updated_count
+                                record["_db_skipped_count"] = skipped_count
+                                record["_db_failed_count"] = db_failed_count
+                                record["_db_failed_rows"] = (
+                                    json.dumps(db_failed_rows, ensure_ascii=False)
+                                    if db_failed_rows
+                                    else ""
+                                )
+
+                            print(
+                                "    DB list sync: "
+                                f"inserted={inserted_count}, "
+                                f"updated={updated_count}, "
+                                f"skipped={skipped_count}, "
+                                f"failed={db_failed_count}"
+                            )
 
                         store.mark_success(mode, item_key, records)
+
+                        success_count += 1
                         backoff.record_success()
                         processed_since_restart += 1
                         processed_total += 1
@@ -1569,32 +1991,81 @@ def scrape_list_command(args: argparse.Namespace) -> int:
                                 current_page_obj = None
 
                         maybe_sleep(args.delay)
+
                     except Exception as exc:
                         if current_page_obj is not None and not current_page_obj.is_closed():
-                            save_debug(current_page_obj, mode, item_key, "list_page_failure")
+                            save_debug(
+                                page=current_page_obj,
+                                mode=mode,
+                                item_key=item_key,
+                                step_name="list_page_failure",
+                            )
+
                             current_page_obj.close()
                             current_page_obj = None
-                        store.mark_failed(mode, item_key, exc, "scrape_list_page")
+
+                        store.mark_failed(
+                            mode=mode,
+                            item_key=item_key,
+                            error=exc,
+                            failed_step="scrape_list_page",
+                        )
+
+                        failed_count += 1
+                        processed_since_restart += 1
+                        processed_total += 1
+
                         logger.exception("LIST_PAGE_FAILED item=%s", item_key)
                         backoff.record_failure()
+
             finally:
                 try:
                     if current_page_obj is not None and not current_page_obj.is_closed():
                         current_page_obj.close()
                 except Exception:
                     pass
+
                 session.close()
 
-        total = export_mode_results(store, mode, Path(args.output), args.format)
-        failed_total = export_failed(store, mode, Path(args.failed) if args.failed else None)
+        # Jangan close store sebelum bagian export dan summary ini.
+        total = export_mode_results(
+            store=store,
+            mode=mode,
+            output=Path(args.output),
+            output_format=args.format,
+        )
+
+        failed_export_total = export_failed(
+            store=store,
+            mode=mode,
+            failed_output=Path(args.failed) if args.failed else None,
+        )
+
         print(f"Exported {total} rows to {args.output}")
+
         if args.failed:
-            print(f"Exported {failed_total} failed rows to {args.failed}")
+            print(f"Exported {failed_export_total} failed rows to {args.failed}")
+
+        print(f"Scrape list sukses: {success_count}")
+        print(f"Scrape list gagal: {failed_count}")
+
+        if getattr(args, "insert_db", False):
+            print(f"DB inserted total: {db_inserted_total}")
+            print(f"DB updated total: {db_updated_total}")
+            print(f"DB skipped total: {db_skipped_total}")
+            print(f"DB failed total: {db_failed_total}")
+
         print(f"State summary: {store.count_by_status(mode)}")
         return 0
-    finally:
-        store.close()
 
+    finally:
+        if db_conn:
+            try:
+                db_conn.close()
+            except Exception:
+                pass
+
+        store.close()
 
 # ============================================================
 # DETAIL SCRAPER
@@ -2447,13 +2918,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     list_parser = subparsers.add_parser("list", help="Scrape daftar paket dari data.inaproc.id/realisasi.")
     list_parser.add_argument("--url", default=None, help="Custom URL override. Jika kosong, URL dibuat dari --year.")
     list_parser.add_argument("--year", type=int, default=2025, help="Tahun paket.")
+    list_parser.add_argument(
+        "--jenis-klpd",
+        nargs="+",
+        default=["3", "4", "5"],
+        help="Daftar jenis KLPD untuk URL realisasi. Contoh: --jenis-klpd 3 4 5.",
+    )
+
+    list_parser.add_argument(
+        "--sumber",
+        default="Tender",
+        help="Sumber transaksi untuk URL realisasi. Default: Tender.",
+    )
     list_parser.add_argument("--start-page", type=int, default=1, help="Halaman awal.")
     list_parser.add_argument("--end-page", "--max-pages", dest="end_page", type=int, default=1, help="Halaman akhir.")
     list_parser.add_argument("--output", default="output/list_final.csv", help="Path output final CSV/JSON.")
     list_parser.add_argument("--failed", default="output/list_failed.csv", help="Path CSV failed rows.")
     list_parser.add_argument("--format", choices=["csv", "json"], default="csv", help="Format output.")
     list_parser.add_argument("--entries-per-page", type=int, default=50, help="Jumlah entri per halaman. Gunakan 0 untuk tidak mengubah.")
+    list_parser.add_argument("--insert-db", action="store_true", help="Insert/update hasil list ke DB tender.details.")
     add_common_browser_args(list_parser, default_headless=True)
+    add_db_args(list_parser)
     list_parser.set_defaults(func=scrape_list_command)
 
     detail_parser = subparsers.add_parser(
