@@ -1980,15 +1980,14 @@ def scrape_list_command(args: argparse.Namespace) -> int:
 
                         store.mark_success(mode, item_key, records)
 
+                        if current_page_obj is not None and not current_page_obj.is_closed():
+                            current_page_obj.close()
+                            current_page_obj = None
+
                         success_count += 1
                         backoff.record_success()
                         processed_since_restart += 1
                         processed_total += 1
-
-                        if page_number < args.end_page:
-                            if not click_next_dataframe_page(current_page_obj):
-                                current_page_obj.close()
-                                current_page_obj = None
 
                         maybe_sleep(args.delay)
 
