@@ -1605,6 +1605,8 @@ def build_realisasi_url(
     year: int,
     jenis_klpd: list[str] | None = None,
     sumber: str = "Tender",
+    limit: int | None = 100,
+    offset: int | None = None,
 ) -> str:
     if jenis_klpd is None:
         jenis_klpd = ["3", "4", "5"]
@@ -1618,48 +1620,109 @@ def build_realisasi_url(
 
     params.append(("sumber", sumber))
 
+    if limit:
+        params.append(("limit", str(limit)))
+
+    if offset is not None:
+        params.append(("offset", str(offset)))
+
     return f"{INAPROC_REALISASI_BASE_URL}?{urlencode(params)}"
+
+def calculate_list_offset(page_number: int, limit: int) -> int:
+    if page_number < 1:
+        raise ValueError("page_number harus minimal 1.")
+
+    return (page_number - 1) * limit
 
 
 def wait_for_dataframe_table(page: Page, timeout: int = DEFAULT_LONG_TIMEOUT_MS) -> None:
-    page.wait_for_selector("table.dataframe tbody tr", timeout=timeout)
+    page.wait_for_selector("table tbody tr", timeout=timeout)
 
 
 def extract_dataframe_table(page: Page) -> list[dict[str, Any]]:
-    table = page.locator("table.dataframe").first
-    table.wait_for(state="attached", timeout=60_000)
+    tables = page.locator("table")
+    table_count = tables.count()
 
-    payload = table.evaluate(
+    if table_count == 0:
+        return []
+
+    selected_table = None
+
+    for index in range(table_count):
+        table = tables.nth(index)
+        header_text = " ".join(table.locator("thead th").all_inner_texts())
+
+        normalized_header = normalize_key(header_text)
+
+        required_keywords = [
+            "kode paket",
+            "nama instansi",
+            "tahun anggaran",
+            "sumber transaksi",
+        ]
+
+        if all(keyword in normalized_header for keyword in required_keywords):
+            selected_table = table
+            break
+
+    if selected_table is None:
+        selected_table = tables.first
+
+    selected_table.wait_for(state="attached", timeout=60_000)
+
+    payload = selected_table.evaluate(
         """
         (table) => {
             const headers = Array.from(table.querySelectorAll("thead th"))
                 .map((cell) => cell.innerText.trim());
+
             const rows = Array.from(table.querySelectorAll("tbody tr")).map((row) =>
                 Array.from(row.querySelectorAll("th, td")).map((cell) => {
                     const link = cell.querySelector("a[href]");
-                    return { text: cell.innerText.trim(), href: link ? link.href : null };
+                    const titleNode = cell.querySelector("[title]");
+                    const title = titleNode ? titleNode.getAttribute("title") : null;
+
+                    return {
+                        text: cell.innerText.trim(),
+                        title: title,
+                        href: link ? link.href : null
+                    };
                 })
             );
+
             return { headers, rows };
         }
         """
     )
 
     rows = payload["rows"]
+
     if not rows:
         return []
 
     width = max(len(row) for row in rows)
     headers = unique_headers(payload["headers"], width)
+
     records: list[dict[str, Any]] = []
 
     for row in rows:
         record: dict[str, Any] = {}
+
         for index, header in enumerate(headers):
-            cell = row[index] if index < len(row) else {"text": "", "href": None}
-            record[header] = clean_text(cell.get("text"))
+            cell = row[index] if index < len(row) else {
+                "text": "",
+                "title": None,
+                "href": None,
+            }
+
+            # Pakai title jika tersedia karena di HTML baru value sering disimpan di title.
+            value = clean_text(cell.get("title") or cell.get("text"))
+
+            record[header] = value
+
             if cell.get("href"):
                 record[f"{header}_url"] = cell["href"]
+
         records.append(record)
 
     return records
@@ -1673,16 +1736,25 @@ def get_page_label(page: Page) -> str:
 
 
 def get_visible_row_count(page: Page) -> int:
-    return page.locator("table.dataframe tbody tr").count()
+    return page.locator("table tbody tr").count()
 
 
 def set_entries_per_page(page: Page, entries_per_page: int) -> None:
     if entries_per_page <= 0:
         return
 
+    # Tampilan lama memakai input aria-label "Entri per halaman".
+    # Tampilan baru memakai limit di URL dan tidak selalu punya selector ini.
     selector = 'input[aria-label*="Entri per halaman"]'
+
     current_select = page.locator(selector).first
-    current_select.wait_for(state="attached", timeout=60_000)
+
+    try:
+        current_select.wait_for(state="attached", timeout=3_000)
+    except Exception:
+        logger.info("Entries-per-page control tidak ditemukan. Skip set_entries_per_page.")
+        return
+
     current_label = current_select.get_attribute("aria-label") or ""
 
     if re.search(rf"\bSelected\s+{entries_per_page}\b", current_label, re.I):
@@ -1690,6 +1762,7 @@ def set_entries_per_page(page: Page, entries_per_page: int) -> None:
 
     previous_row_count = get_visible_row_count(page)
     current_select.click()
+
     option = page.get_by_role("option", name=str(entries_per_page), exact=True)
     option.first.click(timeout=30_000)
 
@@ -1699,7 +1772,7 @@ def set_entries_per_page(page: Page, entries_per_page: int) -> None:
             ([targetRows, oldRowCount]) => {
                 const select = document.querySelector('input[aria-label*="Entri per halaman"]');
                 const selected = select ? select.getAttribute("aria-label") || "" : "";
-                const rowCount = document.querySelectorAll("table.dataframe tbody tr").length;
+                const rowCount = document.querySelectorAll("table tbody tr").length;
                 return selected.includes(`Selected ${targetRows}`)
                     && (rowCount >= targetRows || rowCount !== oldRowCount);
             }
@@ -1722,7 +1795,7 @@ def click_next_dataframe_page(page: Page) -> bool:
 
     previous_label = get_page_label(page)
     previous_first_row = ""
-    first_cell = page.locator("table.dataframe tbody tr:first-child td:first-child")
+    first_cell = page.locator("table tbody tr:first-child td:first-child")
     if first_cell.count() > 0:
         previous_first_row = clean_text(first_cell.first.inner_text(timeout=2_000))
 
@@ -1735,7 +1808,7 @@ def click_next_dataframe_page(page: Page) -> bool:
                 const label = Array.from(document.querySelectorAll("p"))
                     .map((node) => node.innerText.trim())
                     .find((text) => /Halaman\s+\d+\s+dari\s+\d+/i.test(text)) || "";
-                const firstCell = document.querySelector("table.dataframe tbody tr:first-child td:first-child");
+                const firstCell = document.querySelector("table tbody tr:first-child td:first-child");
                 const firstRow = firstCell ? firstCell.innerText.trim() : "";
                 return (label && label !== oldLabel) || (firstRow && firstRow !== oldFirstRow);
             }
@@ -1749,18 +1822,17 @@ def click_next_dataframe_page(page: Page) -> bool:
     return True
 
 
-def open_list_page(session: BrowserSession, url: str, entries_per_page: int, target_page: int) -> Page:
+def open_list_page(session: BrowserSession, url: str) -> Page:
     page = session.new_page()
-    page.goto(url, wait_until="domcontentloaded", timeout=DEFAULT_LONG_TIMEOUT_MS)
-    wait_for_dataframe_table(page, timeout=DEFAULT_LONG_TIMEOUT_MS)
-    set_entries_per_page(page, entries_per_page)
 
-    current_page = 1
-    while current_page < target_page:
-        if not click_next_dataframe_page(page):
-            raise RuntimeError(f"Tidak bisa menuju page {target_page}. Stop di page {current_page}.")
-        current_page += 1
-    return page
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=DEFAULT_LONG_TIMEOUT_MS)
+        wait_for_dataframe_table(page, timeout=DEFAULT_LONG_TIMEOUT_MS)
+        return page
+
+    except Exception:
+        close_page_safely(page)
+        raise
 
 
 def build_list_work_items(start_page: int, end_page: int) -> list[dict[str, Any]]:
@@ -1792,6 +1864,7 @@ def scrape_list_command(args: argparse.Namespace) -> int:
         year=args.year,
         jenis_klpd=args.jenis_klpd,
         sumber=args.sumber,
+        limit=args.entries_per_page,
     )
 
     store = OperationalStore(Path(args.state_db))
@@ -1897,38 +1970,27 @@ def scrape_list_command(args: argparse.Namespace) -> int:
                     item_key = row["item_key"]
                     page_number = int(item["page_number"])
 
-                    if processed_since_restart >= args.restart_browser_every:
-                        if current_page_obj is not None and not current_page_obj.is_closed():
-                            current_page_obj.close()
-                            current_page_obj = None
+                    offset = calculate_list_offset(
+                        page_number=page_number,
+                        limit=args.entries_per_page,
+                    )
 
-                        session.restart(f"every_{args.restart_browser_every}_pages")
-                        processed_since_restart = 0
-
-                    if (
-                        args.cooldown_every > 0
-                        and processed_total > 0
-                        and processed_total % args.cooldown_every == 0
-                    ):
-                        random_cooldown(
-                            args.cooldown_min,
-                            args.cooldown_max,
-                            f"every_{args.cooldown_every}_pages",
-                        )
+                    page_url = args.url or build_realisasi_url(
+                        year=args.year,
+                        jenis_klpd=args.jenis_klpd,
+                        sumber=args.sumber,
+                        limit=args.entries_per_page,
+                        offset=offset,
+                    )
 
                     print(f"[{index}/{len(pending_rows)}] Scraping list page={page_number}")
+                    print(f"    URL: {page_url}")
 
                     try:
-                        if current_page_obj is None or current_page_obj.is_closed():
-                            current_page_obj = open_list_page(
-                                session=session,
-                                url=url,
-                                entries_per_page=args.entries_per_page,
-                                target_page=page_number,
-                            )
-                        elif index > 1:
-                            # Dalam alur normal, page aktif sudah berada di halaman berikutnya.
-                            pass
+                        current_page_obj = open_list_page(
+                            session=session,
+                            url=page_url,
+                        )
 
                         records = extract_dataframe_table(current_page_obj)
 
@@ -1937,6 +1999,8 @@ def scrape_list_command(args: argparse.Namespace) -> int:
                         for record in records:
                             record["_scraped_page"] = page_number
                             record["_page_label"] = page_label
+                            record["_scraped_url"] = page_url
+                            record["_scraped_offset"] = offset
 
                         if getattr(args, "insert_db", False):
                             if db_conn is None or db_config is None:
@@ -1980,14 +2044,17 @@ def scrape_list_command(args: argparse.Namespace) -> int:
 
                         store.mark_success(mode, item_key, records)
 
-                        if current_page_obj is not None and not current_page_obj.is_closed():
-                            current_page_obj.close()
-                            current_page_obj = None
-
                         success_count += 1
                         backoff.record_success()
                         processed_since_restart += 1
                         processed_total += 1
+
+                        # Tutup tab/page setelah 1 halaman selesai diproses.
+                        # Ini lebih aman untuk VPS kecil karena tidak menahan memori DOM/browser page.
+                        if current_page_obj is not None and not current_page_obj.is_closed():
+                            current_page_obj.close()
+
+                        current_page_obj = None
 
                         maybe_sleep(args.delay)
 
@@ -2934,7 +3001,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     list_parser.add_argument("--output", default="output/list_final.csv", help="Path output final CSV/JSON.")
     list_parser.add_argument("--failed", default="output/list_failed.csv", help="Path CSV failed rows.")
     list_parser.add_argument("--format", choices=["csv", "json"], default="csv", help="Format output.")
-    list_parser.add_argument("--entries-per-page", type=int, default=50, help="Jumlah entri per halaman. Gunakan 0 untuk tidak mengubah.")
+    list_parser.add_argument("--entries-per-page", type=int, default=100, help="Jumlah entri per halaman. Gunakan 0 untuk tidak mengubah.")
     list_parser.add_argument("--insert-db", action="store_true", help="Insert/update hasil list ke DB tender.details.")
     add_common_browser_args(list_parser, default_headless=True)
     add_db_args(list_parser)
