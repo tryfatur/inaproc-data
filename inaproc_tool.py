@@ -34,6 +34,9 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import urlencode, urljoin
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+from bs4 import BeautifulSoup
 
 try:
     import psycopg2
@@ -1588,6 +1591,15 @@ def save_debug(page: Page, mode: str, item_key: str, step_name: str) -> None:
     except Exception as exc:
         logger.warning("Failed save HTML mode=%s item=%s step=%s: %s", mode, item_key, step_name, exc)
 
+def close_page_safely(page: Page | None) -> None:
+    if page is None:
+        return
+
+    try:
+        if not page.is_closed():
+            page.close()
+    except Exception:
+        pass
 
 def run_step(step_name: str, func: Callable[[], Any]) -> Any:
     try:
@@ -1600,6 +1612,94 @@ def run_step(step_name: str, func: Callable[[], Any]) -> Any:
 # ============================================================
 # LIST SCRAPER
 # ============================================================
+
+def fetch_html(url: str, timeout: int = 60) -> str:
+    request = Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+        },
+    )
+
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return response.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        raise RuntimeError(f"HTTP error {exc.code} saat fetch URL: {url}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"URL error saat fetch URL: {url}: {exc}") from exc
+
+def extract_table_from_html(html: str) -> list[dict[str, Any]]:
+    soup = BeautifulSoup(html, "html.parser")
+
+    tables = soup.find_all("table")
+    if not tables:
+        return []
+
+    selected_table = None
+
+    for table in tables:
+        header_text = " ".join(th.get_text(" ", strip=True) for th in table.find_all("th"))
+        normalized_header = normalize_key(header_text)
+
+        required_keywords = [
+            "kode paket",
+            "nama instansi",
+            "tahun anggaran",
+            "sumber transaksi",
+        ]
+
+        if all(keyword in normalized_header for keyword in required_keywords):
+            selected_table = table
+            break
+
+    if selected_table is None:
+        selected_table = tables[0]
+
+    header_cells = selected_table.select("thead th")
+    headers = [cell.get_text(" ", strip=True) for cell in header_cells]
+
+    body_rows = selected_table.select("tbody tr")
+    if not body_rows:
+        return []
+
+    width = max(len(row.select("th, td")) for row in body_rows)
+    headers = unique_headers(headers, width)
+
+    records: list[dict[str, Any]] = []
+
+    for row in body_rows:
+        cells = row.select("th, td")
+        record: dict[str, Any] = {}
+
+        for index, header in enumerate(headers):
+            if index >= len(cells):
+                record[header] = ""
+                continue
+
+            cell = cells[index]
+
+            value = clean_text(
+                cell.get("title")
+                or cell.get_text(" ", strip=True)
+            )
+
+            record[header] = value
+
+            link = cell.find("a", href=True)
+            if link:
+                href = link.get("href", "")
+                record[f"{header}_url"] = href
+
+        records.append(record)
+
+    return records
 
 def build_realisasi_url(
     year: int,
@@ -1846,7 +1946,6 @@ def scrape_list_command(args: argparse.Namespace) -> int:
     if args.end_page < args.start_page:
         raise ValueError("--end-page harus lebih besar atau sama dengan --start-page.")
 
-    # Defensive defaults agar tidak terjadi Path(None).
     if not getattr(args, "state_db", None):
         args.state_db = "state/inaproc_state.sqlite"
 
@@ -1856,28 +1955,22 @@ def scrape_list_command(args: argparse.Namespace) -> int:
     if not getattr(args, "failed", None):
         args.failed = "output/list_failed.csv"
 
+    list_engine = getattr(args, "list_engine", "http")
+    limit_per_page = int(getattr(args, "entries_per_page", 100) or 100)
+
+    if limit_per_page < 1:
+        raise ValueError("--entries-per-page / --limit-per-page harus minimal 1 untuk mekanisme limit dan offset.")
+
     mode = "list"
-
-    # Mendukung patch build_realisasi_url yang sudah menerima:
-    # --jenis-klpd dan --sumber.
-    url = args.url or build_realisasi_url(
-        year=args.year,
-        jenis_klpd=args.jenis_klpd,
-        sumber=args.sumber,
-        limit=args.entries_per_page,
-    )
-
     store = OperationalStore(Path(args.state_db))
 
     db_config = None
     db_conn = None
 
-    if getattr(args, "insert_db", False):
-        db_config = DbConfig.from_args(args)
-        db_conn = get_db_connection(db_config)
-        # trace_db_connection(db_conn, db_config)
-
     try:
+        # ====================================================
+        # EXPORT ONLY
+        # ====================================================
         if args.export_only:
             total = export_mode_results(
                 store=store,
@@ -1900,6 +1993,9 @@ def scrape_list_command(args: argparse.Namespace) -> int:
             print(f"State summary: {store.count_by_status(mode)}")
             return 0
 
+        # ====================================================
+        # BUILD / UPSERT WORK ITEMS
+        # ====================================================
         work_items = build_list_work_items(
             start_page=args.start_page,
             end_page=args.end_page,
@@ -1940,6 +2036,16 @@ def scrape_list_command(args: argparse.Namespace) -> int:
             print(f"State summary: {store.count_by_status(mode)}")
             return 0
 
+        # ====================================================
+        # DB CONNECTION
+        # ====================================================
+        if getattr(args, "insert_db", False):
+            db_config = DbConfig.from_args(args)
+            db_conn = get_db_connection(db_config)
+
+        # ====================================================
+        # COUNTERS + BACKOFF
+        # ====================================================
         backoff = FailureBackoff(
             threshold=args.adaptive_error_threshold,
             base_seconds=args.adaptive_cooldown_base,
@@ -1956,144 +2062,222 @@ def scrape_list_command(args: argparse.Namespace) -> int:
         db_skipped_total = 0
         db_failed_total = 0
 
-        current_page_obj: Page | None = None
+        # ====================================================
+        # INNER PAGE PROCESSOR
+        # ====================================================
+        def process_list_row(
+            index: int,
+            row: sqlite3.Row,
+            session: BrowserSession | None = None,
+        ) -> None:
+            nonlocal processed_since_restart
+            nonlocal processed_total
+            nonlocal success_count
+            nonlocal failed_count
+            nonlocal db_inserted_total
+            nonlocal db_updated_total
+            nonlocal db_skipped_total
+            nonlocal db_failed_total
 
-        with sync_playwright() as playwright:
-            session = BrowserSession(
-                playwright=playwright,
-                settings=build_browser_settings(args, width=1440, height=1000),
+            item = row_to_item(row)
+            item_key = row["item_key"]
+            page_number = int(item["page_number"])
+
+            offset = calculate_list_offset(
+                page_number=page_number,
+                limit=limit_per_page,
             )
 
+            # Catatan:
+            # Jika args.url dipakai, URL dianggap override penuh.
+            # Untuk resume berbasis offset, sebaiknya jangan pakai --url manual.
+            page_url = args.url or build_realisasi_url(
+                year=args.year,
+                jenis_klpd=args.jenis_klpd,
+                sumber=args.sumber,
+                limit=limit_per_page,
+                offset=offset,
+            )
+
+            if args.cooldown_every > 0 and processed_total > 0 and processed_total % args.cooldown_every == 0:
+                random_cooldown(
+                    args.cooldown_min,
+                    args.cooldown_max,
+                    f"every_{args.cooldown_every}_pages",
+                )
+
+            print(f"[{index}/{len(pending_rows)}] Scraping list page={page_number}")
+            print(f"    URL: {page_url}")
+
+            current_page_obj: Page | None = None
+
             try:
-                for index, row in enumerate(pending_rows, start=1):
-                    item = row_to_item(row)
-                    item_key = row["item_key"]
-                    page_number = int(item["page_number"])
+                # ============================================
+                # HTTP ENGINE: tidak buka Chromium sama sekali
+                # ============================================
+                if list_engine == "http":
+                    html = fetch_html(page_url)
+                    records = extract_table_from_html(html)
 
-                    offset = calculate_list_offset(
-                        page_number=page_number,
-                        limit=args.entries_per_page,
+                    page_label = (
+                        f"page={page_number}; "
+                        f"limit={limit_per_page}; "
+                        f"offset={offset}"
                     )
 
-                    page_url = args.url or build_realisasi_url(
-                        year=args.year,
-                        jenis_klpd=args.jenis_klpd,
-                        sumber=args.sumber,
-                        limit=args.entries_per_page,
-                        offset=offset,
+                # ============================================
+                # BROWSER ENGINE: fallback Playwright
+                # ============================================
+                elif list_engine == "browser":
+                    if session is None:
+                        raise RuntimeError("Browser session belum tersedia untuk list_engine=browser.")
+
+                    current_page_obj = open_list_page(
+                        session=session,
+                        url=page_url,
                     )
 
-                    print(f"[{index}/{len(pending_rows)}] Scraping list page={page_number}")
-                    print(f"    URL: {page_url}")
+                    records = extract_dataframe_table(current_page_obj)
+                    page_label = get_page_label(current_page_obj)
 
-                    try:
-                        current_page_obj = open_list_page(
-                            session=session,
-                            url=page_url,
+                else:
+                    raise ValueError(f"list_engine tidak dikenal: {list_engine}")
+
+                if not records:
+                    raise RuntimeError(
+                        f"Tidak ada record tabel pada page={page_number}, offset={offset}"
+                    )
+
+                for record in records:
+                    record["_scraped_page"] = page_number
+                    record["_page_label"] = page_label
+                    record["_scraped_url"] = page_url
+                    record["_scraped_offset"] = offset
+                    record["_list_engine"] = list_engine
+
+                # ============================================
+                # INSERT / UPDATE DB
+                # ============================================
+                if getattr(args, "insert_db", False):
+                    if db_conn is None or db_config is None:
+                        raise ValueError("insert_db aktif, tetapi koneksi DB belum tersedia.")
+
+                    (
+                        inserted_count,
+                        updated_count,
+                        skipped_count,
+                        db_failed_count,
+                        db_failed_rows,
+                    ) = insert_or_update_list_records_to_db(
+                        conn=db_conn,
+                        config=db_config,
+                        records=records,
+                    )
+
+                    db_inserted_total += inserted_count
+                    db_updated_total += updated_count
+                    db_skipped_total += skipped_count
+                    db_failed_total += db_failed_count
+
+                    for record in records:
+                        record["_db_inserted_count"] = inserted_count
+                        record["_db_updated_count"] = updated_count
+                        record["_db_skipped_count"] = skipped_count
+                        record["_db_failed_count"] = db_failed_count
+                        record["_db_failed_rows"] = (
+                            json.dumps(db_failed_rows, ensure_ascii=False)
+                            if db_failed_rows
+                            else ""
                         )
 
-                        records = extract_dataframe_table(current_page_obj)
+                    print(
+                        "    DB list sync: "
+                        f"inserted={inserted_count}, "
+                        f"updated={updated_count}, "
+                        f"skipped={skipped_count}, "
+                        f"failed={db_failed_count}"
+                    )
 
-                        page_label = get_page_label(current_page_obj)
+                store.mark_success(mode, item_key, records)
 
-                        for record in records:
-                            record["_scraped_page"] = page_number
-                            record["_page_label"] = page_label
-                            record["_scraped_url"] = page_url
-                            record["_scraped_offset"] = offset
+                success_count += 1
+                backoff.record_success()
 
-                        if getattr(args, "insert_db", False):
-                            if db_conn is None or db_config is None:
-                                raise ValueError("insert_db aktif, tetapi koneksi DB belum tersedia.")
+            except Exception as exc:
+                if current_page_obj is not None and not current_page_obj.is_closed():
+                    save_debug(
+                        page=current_page_obj,
+                        mode=mode,
+                        item_key=item_key,
+                        step_name="list_page_failure",
+                    )
 
-                            (
-                                inserted_count,
-                                updated_count,
-                                skipped_count,
-                                db_failed_count,
-                                db_failed_rows,
-                            ) = insert_or_update_list_records_to_db(
-                                conn=db_conn,
-                                config=db_config,
-                                records=records,
-                            )
+                store.mark_failed(
+                    mode=mode,
+                    item_key=item_key,
+                    error=exc,
+                    failed_step="scrape_list_page",
+                )
 
-                            db_inserted_total += inserted_count
-                            db_updated_total += updated_count
-                            db_skipped_total += skipped_count
-                            db_failed_total += db_failed_count
-
-                            for record in records:
-                                record["_db_inserted_count"] = inserted_count
-                                record["_db_updated_count"] = updated_count
-                                record["_db_skipped_count"] = skipped_count
-                                record["_db_failed_count"] = db_failed_count
-                                record["_db_failed_rows"] = (
-                                    json.dumps(db_failed_rows, ensure_ascii=False)
-                                    if db_failed_rows
-                                    else ""
-                                )
-
-                            print(
-                                "    DB list sync: "
-                                f"inserted={inserted_count}, "
-                                f"updated={updated_count}, "
-                                f"skipped={skipped_count}, "
-                                f"failed={db_failed_count}"
-                            )
-
-                        store.mark_success(mode, item_key, records)
-
-                        success_count += 1
-                        backoff.record_success()
-                        processed_since_restart += 1
-                        processed_total += 1
-
-                        # Tutup tab/page setelah 1 halaman selesai diproses.
-                        # Ini lebih aman untuk VPS kecil karena tidak menahan memori DOM/browser page.
-                        if current_page_obj is not None and not current_page_obj.is_closed():
-                            current_page_obj.close()
-
-                        current_page_obj = None
-
-                        maybe_sleep(args.delay)
-
-                    except Exception as exc:
-                        if current_page_obj is not None and not current_page_obj.is_closed():
-                            save_debug(
-                                page=current_page_obj,
-                                mode=mode,
-                                item_key=item_key,
-                                step_name="list_page_failure",
-                            )
-
-                            current_page_obj.close()
-                            current_page_obj = None
-
-                        store.mark_failed(
-                            mode=mode,
-                            item_key=item_key,
-                            error=exc,
-                            failed_step="scrape_list_page",
-                        )
-
-                        failed_count += 1
-                        processed_since_restart += 1
-                        processed_total += 1
-
-                        logger.exception("LIST_PAGE_FAILED item=%s", item_key)
-                        backoff.record_failure()
+                failed_count += 1
+                logger.exception("LIST_PAGE_FAILED item=%s", item_key)
+                backoff.record_failure()
 
             finally:
+                close_page_safely(current_page_obj)
+                current_page_obj = None
+
+                processed_since_restart += 1
+                processed_total += 1
+
+                maybe_sleep(args.delay)
+
+        # ====================================================
+        # EXECUTION ENGINE
+        # ====================================================
+        if list_engine == "http":
+            # Tidak membuka Playwright/Chromium.
+            for index, row in enumerate(pending_rows, start=1):
+                process_list_row(
+                    index=index,
+                    row=row,
+                    session=None,
+                )
+
+        elif list_engine == "browser":
+            current_page_obj: Page | None = None
+
+            with sync_playwright() as playwright:
+                session = BrowserSession(
+                    playwright=playwright,
+                    settings=build_browser_settings(args, width=1440, height=1000),
+                )
+
                 try:
-                    if current_page_obj is not None and not current_page_obj.is_closed():
-                        current_page_obj.close()
-                except Exception:
-                    pass
+                    for index, row in enumerate(pending_rows, start=1):
+                        if (
+                            args.restart_browser_every > 0
+                            and processed_since_restart >= args.restart_browser_every
+                        ):
+                            session.restart(f"every_{args.restart_browser_every}_pages")
+                            processed_since_restart = 0
 
-                session.close()
+                        process_list_row(
+                            index=index,
+                            row=row,
+                            session=session,
+                        )
 
-        # Jangan close store sebelum bagian export dan summary ini.
+                finally:
+                    close_page_safely(current_page_obj)
+                    session.close()
+
+        else:
+            raise ValueError(f"list_engine tidak dikenal: {list_engine}")
+
+        # ====================================================
+        # EXPORT FINAL RESULT
+        # ====================================================
         total = export_mode_results(
             store=store,
             mode=mode,
@@ -2996,6 +3180,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="Tender",
         help="Sumber transaksi untuk URL realisasi. Default: Tender.",
     )
+
+    list_parser.add_argument(
+    "--list-engine",
+    choices=["http", "browser"],
+    default="http",
+    help="Engine scraping list. Gunakan http untuk hemat resource, browser untuk fallback Playwright.",
+)
+
     list_parser.add_argument("--start-page", type=int, default=1, help="Halaman awal.")
     list_parser.add_argument("--end-page", "--max-pages", dest="end_page", type=int, default=1, help="Halaman akhir.")
     list_parser.add_argument("--output", default="output/list_final.csv", help="Path output final CSV/JSON.")
