@@ -1618,20 +1618,42 @@ def fetch_html(url: str, timeout: int = 60) -> str:
         url,
         headers={
             "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) "
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
+                "Chrome/124.0.0.0 Safari/537.36"
             ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;"
+                "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+            ),
             "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Referer": "https://data.inaproc.id/realisasi",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-User": "?1",
         },
     )
 
     try:
         with urlopen(request, timeout=timeout) as response:
             return response.read().decode("utf-8", errors="replace")
+
     except HTTPError as exc:
-        raise RuntimeError(f"HTTP error {exc.code} saat fetch URL: {url}") from exc
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+
+        raise RuntimeError(
+            f"HTTP error {exc.code} saat fetch URL: {url}. "
+            f"Response body preview: {body}"
+        ) from exc
+
     except URLError as exc:
         raise RuntimeError(f"URL error saat fetch URL: {url}: {exc}") from exc
 
