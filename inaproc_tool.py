@@ -29,6 +29,7 @@ import re
 import sqlite3
 import sys
 import time
+import subprocess
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -1657,6 +1658,47 @@ def fetch_html(url: str, timeout: int = 60) -> str:
     except URLError as exc:
         raise RuntimeError(f"URL error saat fetch URL: {url}: {exc}") from exc
 
+def fetch_html_with_curl(url: str, timeout: int = 60) -> str:
+    command = [
+        "curl",
+        "-sL",
+        "--max-time",
+        str(timeout),
+        "-A",
+        (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "-H",
+        "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "-H",
+        "Accept-Language: id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+        "-H",
+        "Referer: https://data.inaproc.id/realisasi",
+        url,
+    ]
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=timeout + 5,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"curl gagal returncode={result.returncode}. "
+            f"stderr={result.stderr[:500]}"
+        )
+
+    html = result.stdout or ""
+
+    if not html.strip:
+        raise RuntimeError("curl berhasil tetapi response HTML kosong.")
+
+    return html
+
 def extract_table_from_html(html: str) -> list[dict[str, Any]]:
     soup = BeautifulSoup(html, "html.parser")
 
@@ -2138,7 +2180,15 @@ def scrape_list_command(args: argparse.Namespace) -> int:
                 # HTTP ENGINE: tidak buka Chromium sama sekali
                 # ============================================
                 if list_engine == "http":
-                    html = fetch_html(page_url)
+                    try:
+                        html = fetch_html(page_url)
+                    except RuntimeError as exc:
+                        if "HTTP error 403" in str(exc):
+                            print("    HTTP urllib kena 403. Fallback ke curl...")
+                            html = fetch_html_with_curl(page_url)
+                        else:
+                            raise
+
                     records = extract_table_from_html(html)
 
                     page_label = (
